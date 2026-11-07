@@ -1,0 +1,24 @@
+# Java
+server/target/
+*.class
+*.log
+backend.log
+
+# Node
+client/node_modules/
+client/dist/
+
+# Runtime data
+data/
+.tmp/
+
+# Env
+.env
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Claude Code 本地设置
+.claude/settings.local.json

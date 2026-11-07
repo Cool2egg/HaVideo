@@ -1,0 +1,1 @@
+ALTER TABLE ai_usage ADD COLUMN audio_seconds BIGINT NOT NULL DEFAULT 0;
