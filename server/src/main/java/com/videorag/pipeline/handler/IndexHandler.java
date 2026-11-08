@@ -14,6 +14,7 @@ import com.videorag.knowledge.mapper.VideoSegmentMapper;
 import com.videorag.media.MediaService;
 import com.videorag.media.entity.MediaFile;
 import com.videorag.media.mapper.MediaFileMapper;
+import com.videorag.pipeline.LeaseContext;
 import com.videorag.pipeline.Stage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -89,6 +90,7 @@ public class IndexHandler implements StageHandler {
         List<KnowledgeDoc> docs = new ArrayList<>(chunks.size());
         int embedded = 0;
         for (KnowledgeChunk chunk : chunks) {
+            LeaseContext.throwIfLost();
             String rawText = rawText(segments, chunk.getStartMs(), chunk.getEndMs());
             String keywords = chunk.getKeywords() == null ? "" : chunk.getKeywords();
             String docText = (chunk.getSummary() == null ? "" : chunk.getSummary())

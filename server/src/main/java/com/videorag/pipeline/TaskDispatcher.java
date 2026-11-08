@@ -1,7 +1,6 @@
 package com.videorag.pipeline;
 
 import com.alibaba.fastjson2.JSONObject;
-import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.videorag.pipeline.entity.ProcessTask;
 import com.videorag.pipeline.mapper.ProcessTaskMapper;
@@ -19,13 +18,16 @@ import java.util.List;
 public class TaskDispatcher {
 
     private static final Logger log = LoggerFactory.getLogger(TaskDispatcher.class);
-    private static final int LEASE_MINUTES = 15;
+    private static final int BATCH_SIZE = 20;
 
     private final ProcessTaskMapper taskMapper;
     private final RocketMQTemplate rocketMQTemplate;
 
     @Value("${rocketmq.topic.pipeline:videorag-pipeline}")
     private String topic;
+
+    @Value("${app.pipeline.lease.queue-timeout-seconds:120}")
+    private long queueTimeoutSeconds;
 
     public TaskDispatcher(ProcessTaskMapper taskMapper, RocketMQTemplate rocketMQTemplate) {
         this.taskMapper = taskMapper;
@@ -34,7 +36,7 @@ public class TaskDispatcher {
 
     @Scheduled(fixedDelay = 3000, initialDelay = 5000)
     public void dispatch() {
-        resetStaleLeases();
+        resetExpired();
         LocalDateTime now = LocalDateTime.now();
         List<ProcessTask> due = taskMapper.selectList(
                 Wrappers.<ProcessTask>lambdaQuery()
@@ -42,19 +44,26 @@ public class TaskDispatcher {
                         .and(query -> query.isNull(ProcessTask::getNextRetryAt)
                                 .or().le(ProcessTask::getNextRetryAt, now))
                         .orderByAsc(ProcessTask::getId)
-                        .last("limit 20"));
+                        .last("limit " + BATCH_SIZE));
         for (ProcessTask task : due) {
             dispatchOne(task);
         }
     }
 
     private void dispatchOne(ProcessTask task) {
-        LambdaUpdateWrapper<ProcessTask> lock = Wrappers.<ProcessTask>lambdaUpdate()
+        long currentVersion = task.getLeaseVersion() == null ? 0L : task.getLeaseVersion();
+        long nextVersion = currentVersion + 1;
+        LocalDateTime now = LocalDateTime.now();
+        int queued = taskMapper.update(null, Wrappers.<ProcessTask>lambdaUpdate()
                 .eq(ProcessTask::getId, task.getId())
                 .in(ProcessTask::getStatus, TaskStatus.PENDING.name(), TaskStatus.RETRYING.name())
-                .set(ProcessTask::getStatus, TaskStatus.RUNNING.name())
-                .set(ProcessTask::getLockedUntil, LocalDateTime.now().plusMinutes(LEASE_MINUTES));
-        if (taskMapper.update(null, lock) == 0) {
+                .eq(ProcessTask::getLeaseVersion, currentVersion)
+                .set(ProcessTask::getStatus, TaskStatus.QUEUED.name())
+                .set(ProcessTask::getLeaseVersion, nextVersion)
+                .set(ProcessTask::getLockedUntil, now.plusSeconds(queueTimeoutSeconds))
+                .set(ProcessTask::getNextRetryAt, null)
+                .set(ProcessTask::getWorkerId, null));
+        if (queued == 0) {
             return;
         }
 
@@ -62,30 +71,39 @@ public class TaskDispatcher {
         message.put("taskId", task.getId());
         message.put("mediaId", task.getMediaId());
         message.put("stage", task.getStage());
+        message.put("leaseVersion", nextVersion);
         try {
             rocketMQTemplate.syncSend(topic + ":" + task.getStage(), message.toJSONString());
         } catch (RuntimeException error) {
             log.warn("mq_send_failed taskId={} stage={}", task.getId(), task.getStage(), error);
-            ProcessTask reset = new ProcessTask();
-            reset.setId(task.getId());
-            reset.setStatus(TaskStatus.RETRYING.name());
-            reset.setLockedUntil(null);
-            reset.setNextRetryAt(LocalDateTime.now().plusSeconds(30));
-            reset.setErrorMessage("消息投递失败");
-            taskMapper.updateById(reset);
+            taskMapper.update(null, Wrappers.<ProcessTask>lambdaUpdate()
+                    .eq(ProcessTask::getId, task.getId())
+                    .eq(ProcessTask::getStatus, TaskStatus.QUEUED.name())
+                    .eq(ProcessTask::getLeaseVersion, nextVersion)
+                    .set(ProcessTask::getStatus, TaskStatus.RETRYING.name())
+                    .set(ProcessTask::getLockedUntil, null)
+                    .set(ProcessTask::getNextRetryAt, LocalDateTime.now().plusSeconds(30))
+                    .set(ProcessTask::getErrorMessage, "消息投递失败"));
         }
     }
 
-    private void resetStaleLeases() {
-        LambdaUpdateWrapper<ProcessTask> update = Wrappers.<ProcessTask>lambdaUpdate()
+    private void resetExpired() {
+        LocalDateTime now = LocalDateTime.now();
+        int running = taskMapper.update(null, Wrappers.<ProcessTask>lambdaUpdate()
                 .eq(ProcessTask::getStatus, TaskStatus.RUNNING.name())
-                .lt(ProcessTask::getLockedUntil, LocalDateTime.now())
+                .lt(ProcessTask::getLockedUntil, now)
                 .set(ProcessTask::getStatus, TaskStatus.RETRYING.name())
                 .set(ProcessTask::getLockedUntil, null)
-                .set(ProcessTask::getNextRetryAt, LocalDateTime.now());
-        int reset = taskMapper.update(null, update);
-        if (reset > 0) {
-            log.warn("stale_tasks_reset count={}", reset);
+                .set(ProcessTask::getWorkerId, null)
+                .set(ProcessTask::getNextRetryAt, now));
+        int queued = taskMapper.update(null, Wrappers.<ProcessTask>lambdaUpdate()
+                .eq(ProcessTask::getStatus, TaskStatus.QUEUED.name())
+                .lt(ProcessTask::getLockedUntil, now)
+                .set(ProcessTask::getStatus, TaskStatus.RETRYING.name())
+                .set(ProcessTask::getLockedUntil, null)
+                .set(ProcessTask::getNextRetryAt, now));
+        if (running + queued > 0) {
+            log.warn("pipeline_expired_reset running={} queued={}", running, queued);
         }
     }
 }

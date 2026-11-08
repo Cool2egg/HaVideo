@@ -121,6 +121,7 @@ public class AdminService {
                 .set(ProcessTask::getStatus, TaskStatus.PENDING.name())
                 .set(ProcessTask::getAttempt, 0)
                 .set(ProcessTask::getLockedUntil, null)
+                .set(ProcessTask::getWorkerId, null)
                 .set(ProcessTask::getNextRetryAt, LocalDateTime.now())
                 .set(ProcessTask::getErrorCode, null)
                 .set(ProcessTask::getErrorMessage, null));

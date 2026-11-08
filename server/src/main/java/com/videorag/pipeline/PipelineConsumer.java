@@ -10,12 +10,15 @@ import com.videorag.pipeline.handler.HandlerRegistry;
 import com.videorag.pipeline.mapper.ProcessTaskMapper;
 import org.apache.rocketmq.spring.annotation.RocketMQMessageListener;
 import org.apache.rocketmq.spring.core.RocketMQListener;
-import org.redisson.api.RLock;
-import org.redisson.api.RedissonClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
+import java.time.LocalDateTime;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 @Component
@@ -26,111 +29,120 @@ import java.util.concurrent.TimeUnit;
 public class PipelineConsumer implements RocketMQListener<String> {
 
     private static final Logger log = LoggerFactory.getLogger(PipelineConsumer.class);
-    private static final String STAGE_LOCK_PREFIX = "pipeline:stage:";
+    private static final String WORKER_ID = workerId();
+    private static final ScheduledExecutorService HEARTBEAT =
+            Executors.newScheduledThreadPool(1, runnable -> {
+                Thread thread = new Thread(runnable, "pipeline-lease-heartbeat");
+                thread.setDaemon(true);
+                return thread;
+            });
 
     private final ProcessTaskMapper taskMapper;
     private final MediaFileMapper mediaFileMapper;
     private final HandlerRegistry handlerRegistry;
     private final PipelineOrchestrator orchestrator;
-    private final RedissonClient redissonClient;
+    private final TaskService taskService;
+
+    @Value("${app.pipeline.lease.heartbeat-seconds:30}")
+    private long heartbeatSeconds;
+
+    @Value("${app.pipeline.lease.timeout-seconds:90}")
+    private long leaseTimeoutSeconds;
 
     public PipelineConsumer(ProcessTaskMapper taskMapper,
                             MediaFileMapper mediaFileMapper,
                             HandlerRegistry handlerRegistry,
                             PipelineOrchestrator orchestrator,
-                            RedissonClient redissonClient) {
+                            TaskService taskService) {
         this.taskMapper = taskMapper;
         this.mediaFileMapper = mediaFileMapper;
         this.handlerRegistry = handlerRegistry;
         this.orchestrator = orchestrator;
-        this.redissonClient = redissonClient;
+        this.taskService = taskService;
     }
 
     @Override
     public void onMessage(String message) {
         JSONObject payload;
+        Long taskId;
         Long mediaId;
+        Long leaseVersion;
         String stageName;
         try {
             payload = JSON.parseObject(message);
+            taskId = payload.getLong("taskId");
             mediaId = payload.getLong("mediaId");
             stageName = payload.getString("stage");
+            leaseVersion = payload.getLong("leaseVersion");
         } catch (RuntimeException error) {
             log.error("pipeline_message_malformed message={}", message, error);
             return;
         }
-        if (mediaId == null || stageName == null) {
+        if (taskId == null || mediaId == null || stageName == null || leaseVersion == null) {
             log.warn("pipeline_message_incomplete message={}", message);
             return;
         }
 
-        RLock lock = redissonClient.getLock(stageLockKey(mediaId, stageName));
-        if (!acquire(lock, mediaId, stageName)) {
+        LocalDateTime leasedUntil = LocalDateTime.now().plusSeconds(leaseTimeoutSeconds);
+        if (!taskService.claim(taskId, leaseVersion, WORKER_ID, leasedUntil)) {
+            log.info("task_claim_lost taskId={} mediaId={} stage={} leaseVersion={}",
+                    taskId, mediaId, stageName, leaseVersion);
             return;
         }
 
-        ProcessTask task = null;
+        ProcessTask task = taskMapper.selectById(taskId);
+        if (task == null) {
+            log.warn("task_missing_after_claim taskId={}", taskId);
+            return;
+        }
+        MediaFile media = mediaFileMapper.selectById(task.getMediaId());
+        if (media != null) {
+            UsageContext.set(media.getUserId());
+        }
+
+        LeaseContext.Guard guard = LeaseContext.open();
+        ScheduledFuture<?> heartbeat = startHeartbeat(taskId, leaseVersion, guard);
         try {
-            Long taskId = payload.getLong("taskId");
-            task = taskMapper.selectById(taskId);
-            if (task == null) {
-                log.warn("task_message_missing taskId={}", taskId);
-                return;
-            }
-            if (!TaskStatus.RUNNING.name().equals(task.getStatus())) {
-                log.info("task_message_ignored taskId={} status={}", taskId, task.getStatus());
-                return;
-            }
-            MediaFile media = mediaFileMapper.selectById(task.getMediaId());
-            if (media != null) {
-                UsageContext.set(media.getUserId());
-            }
             Stage stage = Stage.valueOf(task.getStage());
             handlerRegistry.require(stage).handle(task.getMediaId());
-            orchestrator.success(task);
+            heartbeat.cancel(false);
+            orchestrator.success(task, leaseVersion);
+        } catch (LeaseLostException error) {
+            log.warn("stage_lease_lost mediaId={} stage={} leaseVersion={} workerId={}",
+                    task.getMediaId(), task.getStage(), leaseVersion, WORKER_ID);
         } catch (Exception error) {
-            if (task != null) {
-                orchestrator.failure(task, error);
-            } else {
-                log.error("pipeline_message_failed message={}", message, error);
-            }
+            heartbeat.cancel(false);
+            orchestrator.failure(task, error, leaseVersion);
         } finally {
-            release(lock);
+            heartbeat.cancel(false);
+            LeaseContext.close();
             UsageContext.clear();
         }
     }
 
-    private boolean acquire(RLock lock, Long mediaId, String stage) {
-        try {
-            boolean locked = lock.tryLock(0, -1, TimeUnit.SECONDS);
-            if (!locked) {
-                log.info("pipeline_stage_busy mediaId={} stage={}", mediaId, stage);
+    private ScheduledFuture<?> startHeartbeat(Long taskId, long leaseVersion, LeaseContext.Guard guard) {
+        long period = Math.max(5, heartbeatSeconds);
+        return HEARTBEAT.scheduleAtFixedRate(() -> {
+            if (guard.isLost()) {
+                return;
             }
-            return locked;
-        } catch (InterruptedException error) {
-            Thread.currentThread().interrupt();
-            log.warn("pipeline_lock_interrupted mediaId={} stage={}", mediaId, stage);
-            return false;
-        } catch (RuntimeException error) {
-            // 锁不可用不标记业务失败，任务交给租约过期回收
-            log.warn("pipeline_lock_unavailable mediaId={} stage={} error={}",
-                    mediaId, stage, error.getMessage());
-            return false;
-        }
+            try {
+                boolean renewed = taskService.renewLease(taskId, leaseVersion,
+                        LocalDateTime.now().plusSeconds(leaseTimeoutSeconds));
+                if (!renewed) {
+                    guard.markLost();
+                    log.warn("lease_renew_failed taskId={} leaseVersion={} workerId={}",
+                            taskId, leaseVersion, WORKER_ID);
+                }
+            } catch (RuntimeException error) {
+                log.warn("lease_renew_error taskId={} error={}", taskId, error.getMessage());
+            }
+        }, period, period, TimeUnit.SECONDS);
     }
 
-    private void release(RLock lock) {
-        try {
-            if (lock.isHeldByCurrentThread()) {
-                lock.unlock();
-            }
-        } catch (RuntimeException error) {
-            log.warn("pipeline_lock_release_failed lock={} error={}",
-                    lock.getName(), error.getMessage());
-        }
-    }
-
-    private String stageLockKey(Long mediaId, String stage) {
-        return STAGE_LOCK_PREFIX + mediaId + ":" + stage;
+    private static String workerId() {
+        String host = System.getenv().getOrDefault("HOSTNAME",
+                System.getenv().getOrDefault("COMPUTERNAME", "unknown"));
+        return host + "-" + ProcessHandle.current().pid();
     }
 }

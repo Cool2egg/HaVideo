@@ -50,9 +50,13 @@ public class PipelineOrchestrator {
         this.taskEventService = taskEventService;
     }
 
-    public void success(ProcessTask task) {
+    public void success(ProcessTask task, long leaseVersion) {
         Stage stage = Stage.valueOf(task.getStage());
-        taskService.markSuccess(task);
+        if (!taskService.markSuccess(task, leaseVersion)) {
+            log.warn("stage_success_ignored mediaId={} stage={} leaseVersion={}",
+                    task.getMediaId(), stage, leaseVersion);
+            return;
+        }
 
         Stage next = stage.next();
         if (next != null) {
@@ -65,12 +69,17 @@ public class PipelineOrchestrator {
             mediaService.updateProgress(task.getMediaId(), "READY", 100);
             publish(task.getMediaId(), "READY", 100, stage.name(), "处理完成");
         }
-        log.info("stage_success mediaId={} stage={}", task.getMediaId(), stage);
+        log.info("stage_success mediaId={} stage={} leaseVersion={}",
+                task.getMediaId(), stage, leaseVersion);
     }
 
-    public void failure(ProcessTask task, Throwable error) {
+    public void failure(ProcessTask task, Throwable error, long leaseVersion) {
         Stage stage = Stage.valueOf(task.getStage());
-        taskService.markRetry(task, error, MAX_ATTEMPTS);
+        if (!taskService.markRetry(task, error, MAX_ATTEMPTS, leaseVersion)) {
+            log.warn("stage_failure_ignored mediaId={} stage={} leaseVersion={}",
+                    task.getMediaId(), stage, leaseVersion);
+            return;
+        }
         int progress = completedProgress(task.getMediaId());
 
         if (TaskStatus.FAILED.name().equals(task.getStatus())) {

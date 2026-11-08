@@ -10,6 +10,7 @@ import com.videorag.media.entity.MediaArtifact;
 import com.videorag.media.entity.MediaFile;
 import com.videorag.media.mapper.MediaArtifactMapper;
 import com.videorag.media.mapper.MediaFileMapper;
+import com.videorag.pipeline.LeaseContext;
 import com.videorag.pipeline.Stage;
 import com.videorag.pipeline.StageSupport;
 import org.slf4j.Logger;
@@ -74,6 +75,7 @@ public class AudioHandler implements StageHandler {
             long duration = media.getDurationMs() == null ? 0 : media.getDurationMs();
             int seq = 1;
             for (Path segment : segments) {
+                LeaseContext.throwIfLost();
                 String objectKey = "audio/" + mediaId + "/" + seq + ".wav";
                 try (InputStream stream = Files.newInputStream(segment)) {
                     storageService.put(objectKey, stream, Files.size(segment), "audio/wav");

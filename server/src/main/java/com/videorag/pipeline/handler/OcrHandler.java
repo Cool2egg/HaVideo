@@ -10,6 +10,7 @@ import com.videorag.media.OcrService;
 import com.videorag.media.StorageService;
 import com.videorag.media.entity.MediaArtifact;
 import com.videorag.media.mapper.MediaArtifactMapper;
+import com.videorag.pipeline.LeaseContext;
 import com.videorag.pipeline.Stage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -73,6 +74,7 @@ public class OcrHandler implements StageHandler {
             int recognized = 0;
             String previousText = "";
             for (MediaArtifact keyframe : keyframes) {
+                LeaseContext.throwIfLost();
                 Path image = workspace.resolve("frame_" + keyframe.getSeq() + ".jpg");
                 try (InputStream stream = storageService.get(keyframe.getObjectKey())) {
                     Files.copy(stream, image, StandardCopyOption.REPLACE_EXISTING);

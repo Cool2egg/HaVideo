@@ -10,6 +10,7 @@ import com.videorag.media.entity.MediaArtifact;
 import com.videorag.media.entity.MediaFile;
 import com.videorag.media.mapper.MediaArtifactMapper;
 import com.videorag.media.mapper.MediaFileMapper;
+import com.videorag.pipeline.LeaseContext;
 import com.videorag.pipeline.Stage;
 import com.videorag.pipeline.StageSupport;
 import org.slf4j.Logger;
@@ -75,6 +76,7 @@ public class KeyframeHandler implements StageHandler {
             List<Long> keptHashes = new ArrayList<>();
             int kept = 0;
             for (FfmpegService.Frame frameInfo : frames) {
+                LeaseContext.throwIfLost();
                 Path frame = frameInfo.path();
                 long startMs = frameInfo.timestampMs();
                 long computedHash;

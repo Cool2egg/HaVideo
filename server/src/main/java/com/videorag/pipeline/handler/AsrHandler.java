@@ -9,6 +9,7 @@ import com.videorag.media.MediaService;
 import com.videorag.media.StorageService;
 import com.videorag.media.entity.MediaArtifact;
 import com.videorag.media.mapper.MediaArtifactMapper;
+import com.videorag.pipeline.LeaseContext;
 import com.videorag.pipeline.Stage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -72,6 +73,7 @@ public class AsrHandler implements StageHandler {
             workspace = Files.createTempDirectory("videorag-asr-");
             int totalSegments = 0;
             for (MediaArtifact artifact : artifacts) {
+                LeaseContext.throwIfLost();
                 Path audio = workspace.resolve("asr_" + artifact.getSeq() + ".wav");
                 try (InputStream stream = storageService.get(artifact.getObjectKey())) {
                     Files.copy(stream, audio, StandardCopyOption.REPLACE_EXISTING);

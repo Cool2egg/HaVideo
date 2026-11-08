@@ -17,6 +17,8 @@ public class ProcessTask {
     private String stage;
     private String status;
     private Integer attempt;
+    private Long leaseVersion;
+    private String workerId;
     private LocalDateTime lockedUntil;
     private String errorCode;
     private String errorMessage;

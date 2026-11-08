@@ -9,6 +9,7 @@ import com.videorag.knowledge.entity.VideoSegment;
 import com.videorag.knowledge.mapper.KnowledgeChunkMapper;
 import com.videorag.knowledge.mapper.VideoSegmentMapper;
 import com.videorag.media.MediaService;
+import com.videorag.pipeline.LeaseContext;
 import com.videorag.pipeline.Stage;
 import com.videorag.pipeline.StageSupport;
 import org.slf4j.Logger;
@@ -63,6 +64,7 @@ public class ChunkHandler implements StageHandler {
         long lastEnd = segments.get(segments.size() - 1).getEndMs();
         int chunkIndex = 0;
         for (long start = 0; start < lastEnd; start += CHUNK_MS) {
+            LeaseContext.throwIfLost();
             long end = start + CHUNK_MS;
             long windowStart = start;
             long windowEnd = end;

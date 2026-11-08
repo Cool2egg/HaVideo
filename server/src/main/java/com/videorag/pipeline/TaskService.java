@@ -28,6 +28,7 @@ public class TaskService {
         task.setStage(stage.name());
         task.setStatus(TaskStatus.PENDING.name());
         task.setAttempt(0);
+        task.setLeaseVersion(0L);
         task.setNextRetryAt(LocalDateTime.now());
         try {
             taskMapper.insert(task);
@@ -43,56 +44,90 @@ public class TaskService {
         return taskMapper.selectOne(query);
     }
 
-    public void markSuccess(ProcessTask task) {
-        task.setStatus(TaskStatus.SUCCESS.name());
-        task.setLockedUntil(null);
-        task.setErrorMessage(null);
-        task.setErrorCode(null);
-        taskMapper.update(null, Wrappers.<ProcessTask>lambdaUpdate()
+    public boolean claim(Long taskId, long leaseVersion, String workerId, LocalDateTime leasedUntil) {
+        return taskMapper.update(null, Wrappers.<ProcessTask>lambdaUpdate()
+                .eq(ProcessTask::getId, taskId)
+                .eq(ProcessTask::getStatus, TaskStatus.QUEUED.name())
+                .eq(ProcessTask::getLeaseVersion, leaseVersion)
+                .set(ProcessTask::getStatus, TaskStatus.RUNNING.name())
+                .set(ProcessTask::getWorkerId, workerId)
+                .set(ProcessTask::getLockedUntil, leasedUntil)) == 1;
+    }
+
+    public boolean renewLease(Long taskId, long leaseVersion, LocalDateTime leasedUntil) {
+        return taskMapper.update(null, Wrappers.<ProcessTask>lambdaUpdate()
+                .eq(ProcessTask::getId, taskId)
+                .eq(ProcessTask::getStatus, TaskStatus.RUNNING.name())
+                .eq(ProcessTask::getLeaseVersion, leaseVersion)
+                .set(ProcessTask::getLockedUntil, leasedUntil)) == 1;
+    }
+
+    public boolean markSuccess(ProcessTask task, long leaseVersion) {
+        int updated = taskMapper.update(null, Wrappers.<ProcessTask>lambdaUpdate()
                 .eq(ProcessTask::getId, task.getId())
+                .eq(ProcessTask::getStatus, TaskStatus.RUNNING.name())
+                .eq(ProcessTask::getLeaseVersion, leaseVersion)
                 .set(ProcessTask::getStatus, TaskStatus.SUCCESS.name())
                 .set(ProcessTask::getLockedUntil, null)
                 .set(ProcessTask::getErrorMessage, null)
                 .set(ProcessTask::getErrorCode, null)
                 .set(ProcessTask::getNextRetryAt, null));
+        if (updated == 0) {
+            return false;
+        }
+        task.setStatus(TaskStatus.SUCCESS.name());
+        task.setLockedUntil(null);
+        task.setErrorMessage(null);
+        task.setErrorCode(null);
+        task.setNextRetryAt(null);
+        return true;
     }
 
-    public void markRetry(ProcessTask task, Throwable error, int maxAttempts) {
+    public boolean markRetry(ProcessTask task, Throwable error, int maxAttempts, long leaseVersion) {
         int attempt = task.getAttempt() == null ? 0 : task.getAttempt();
-        task.setAttempt(attempt + 1);
-        task.setLockedUntil(null);
-        task.setErrorMessage(truncate(error.getMessage()));
+        int nextAttempt = attempt + 1;
+        boolean exhausted = nextAttempt >= maxAttempts;
+        String nextStatus = exhausted ? TaskStatus.FAILED.name() : TaskStatus.RETRYING.name();
+        LocalDateTime nextRetryAt = exhausted
+                ? null
+                : LocalDateTime.now().plusSeconds(Math.min(300, 5L << Math.min(6, nextAttempt)));
+        String message = truncate(error.getMessage());
 
-        boolean exhausted = task.getAttempt() >= maxAttempts;
-        if (exhausted) {
-            task.setStatus(TaskStatus.FAILED.name());
-            task.setNextRetryAt(null);
-        } else {
-            task.setStatus(TaskStatus.RETRYING.name());
-            long delaySeconds = Math.min(300, 5L << Math.min(6, task.getAttempt()));
-            task.setNextRetryAt(LocalDateTime.now().plusSeconds(delaySeconds));
-        }
-
-        taskMapper.update(null, Wrappers.<ProcessTask>lambdaUpdate()
+        int updated = taskMapper.update(null, Wrappers.<ProcessTask>lambdaUpdate()
                 .eq(ProcessTask::getId, task.getId())
-                .set(ProcessTask::getStatus, task.getStatus())
-                .set(ProcessTask::getAttempt, task.getAttempt())
+                .eq(ProcessTask::getStatus, TaskStatus.RUNNING.name())
+                .eq(ProcessTask::getLeaseVersion, leaseVersion)
+                .set(ProcessTask::getStatus, nextStatus)
+                .set(ProcessTask::getAttempt, nextAttempt)
                 .set(ProcessTask::getLockedUntil, null)
-                .set(ProcessTask::getErrorMessage, task.getErrorMessage())
-                .set(ProcessTask::getNextRetryAt, task.getNextRetryAt()));
+                .set(ProcessTask::getWorkerId, null)
+                .set(ProcessTask::getErrorMessage, message)
+                .set(ProcessTask::getNextRetryAt, nextRetryAt));
+        if (updated == 0) {
+            return false;
+        }
+        task.setStatus(nextStatus);
+        task.setAttempt(nextAttempt);
+        task.setLockedUntil(null);
+        task.setWorkerId(null);
+        task.setErrorMessage(message);
+        task.setNextRetryAt(nextRetryAt);
         log.warn("task_failed mediaId={} stage={} attempt={} error={}",
-                task.getMediaId(), task.getStage(), task.getAttempt(), error.getMessage());
+                task.getMediaId(), task.getStage(), nextAttempt, error.getMessage());
+        return true;
     }
 
     public void reset(ProcessTask task) {
         task.setStatus(TaskStatus.PENDING.name());
         task.setLockedUntil(null);
+        task.setWorkerId(null);
         task.setNextRetryAt(LocalDateTime.now());
         task.setErrorMessage(null);
         taskMapper.update(null, Wrappers.<ProcessTask>lambdaUpdate()
                 .eq(ProcessTask::getId, task.getId())
                 .set(ProcessTask::getStatus, TaskStatus.PENDING.name())
                 .set(ProcessTask::getLockedUntil, null)
+                .set(ProcessTask::getWorkerId, null)
                 .set(ProcessTask::getNextRetryAt, LocalDateTime.now())
                 .set(ProcessTask::getErrorCode, null)
                 .set(ProcessTask::getErrorMessage, null));
